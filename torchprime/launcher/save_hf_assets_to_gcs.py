@@ -6,7 +6,12 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from datasets import DatasetDict, load_dataset
 from huggingface_hub import snapshot_download
+from transformers import AutoTokenizer
+
+from torchprime.data import dataset as torchprime_dataset
+from torchprime.torch_xla_models.model import model_utils
 
 logger = logging.getLogger(__name__)
 
@@ -92,3 +97,91 @@ def save_hf_model_files_to_gcs(
     logger.info(f"Files for '{repo_id}' downloaded locally to '{snapshot_path}'.")
 
     _upload_directory_to_gcs(Path(snapshot_path), gcs_path)
+
+
+def _save_raw_dataset(
+  repo_id: str,
+  gcs_path: str,
+  config_name: str | None,
+  split: str | None,
+  temp_dir: str | None,
+):
+  """Saves raw dataset splits to GCS.
+
+  If a split is specified, only that split is saved. Otherwise, all splits
+  are saved as a `DatasetDict`.
+  """
+  with tempfile.TemporaryDirectory(dir=temp_dir) as tmpdir:
+    dataset = load_dataset(repo_id, name=config_name, split=split, cache_dir=tmpdir)
+    if split is None:
+      assert isinstance(dataset, DatasetDict)
+
+    save_path = Path(tmpdir) / "raw_dataset"
+    logger.info(f"Saving raw dataset to disk at '{save_path}'...")
+    dataset.save_to_disk(str(save_path))
+
+    _upload_directory_to_gcs(save_path, gcs_path)
+
+
+def _save_preprocessed_dataset(
+  repo_id: str,
+  gcs_path: str,
+  config_name: str | None,
+  split: str | None,
+  tokenizer_repo_id: str,
+  block_size: int,
+  temp_dir: str | None,
+):
+  """Preprocesses dataset splits and saves them to GCS.
+
+  If a split is specified, only that split is preprocessed and saved.
+  Otherwise, all available splits are preprocessed and saved as a `DatasetDict`.
+  """
+  with tempfile.TemporaryDirectory(dir=temp_dir) as tmpdir:
+    logger.info(f"Loading tokenizer '{tokenizer_repo_id}'...")
+    with model_utils.local_path_from_gcs(
+      tokenizer_repo_id, temp_dir=tmpdir
+    ) as tokenizer_path:
+      tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    processed_dataset = torchprime_dataset.make_train_dataset(
+      hf_dataset_name=repo_id,
+      hf_dataset_config_name=config_name,
+      split=split,
+      tokenizer=tokenizer,
+      block_size=block_size,
+      cache_dir=tmpdir,
+    )
+
+    save_path = Path(tmpdir) / "preprocessed_dataset"
+    logger.info(f"Saving preprocessed dataset to disk at '{save_path}'...")
+    processed_dataset.save_to_disk(str(save_path))
+
+    _upload_directory_to_gcs(save_path, gcs_path)
+
+
+def save_hf_dataset_to_gcs(
+  repo_id: str,
+  gcs_path: str,
+  config_name: str | None = None,
+  split: str | None = None,
+  preprocess: bool = False,
+  tokenizer_repo_id: str | None = None,
+  block_size: int | None = None,
+  temp_dir: str | None = None,
+):
+  """Downloads a Hugging Face dataset, optionally preprocesses it, and uploads to GCS."""
+  action = "Processing" if preprocess else "Saving raw"
+  split_info = f"split '{split}'" if split else "all splits"
+  logger.info(f"{action} {split_info} of dataset '{repo_id}'.")
+
+  if preprocess:
+    if not tokenizer_repo_id or not block_size:
+      raise ValueError(
+        "For preprocessing, 'tokenizer_repo_id' and 'block_size' must be provided."
+      )
+    _save_preprocessed_dataset(
+      repo_id, gcs_path, config_name, split, tokenizer_repo_id, block_size, temp_dir
+    )
+  else:
+    _save_raw_dataset(repo_id, gcs_path, config_name, split, temp_dir)
